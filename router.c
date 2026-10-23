@@ -47,7 +47,7 @@ int find_route_index(struct Connection* routing_table, int routing_table_idx, st
     return -1;
 }
 
-// wczytanie interfejsów dla danego routera
+// Read router interfaces from stdin
 void read_interfaces(
     struct Connection* directly, int* directly_idx,
     struct Connection* routing_table, int* routing_table_idx,
@@ -89,8 +89,9 @@ void read_interfaces(
     }
 }
 
+// Create and configure UDP socket
 int setup_socket(uint16_t port) {
-    // tworzenie socketa
+    // Create UDP socket
     int sockfd = socket(
         AF_INET,
         SOCK_DGRAM,
@@ -101,7 +102,7 @@ int setup_socket(uint16_t port) {
         ERROR("socket error");
     }
 
-    // ustawianie opcji gnizda żeby mógł nadawać na broadcast
+    // Enable SO_BROADCAST to allow sending broadcast packets
     int so_value = 1;
     setsockopt(
         sockfd,
@@ -111,11 +112,11 @@ int setup_socket(uint16_t port) {
         sizeof(so_value)
     );
 
-    // wiązanie gniazda z adresem ip i portem
+    // Bind socket to IP address and port
     struct sockaddr_in server_address = {0};
     server_address.sin_family = AF_INET;
     server_address.sin_port = htons(port);
-    server_address.sin_addr.s_addr = htonl(INADDR_ANY); // nie ważne na jaki adres ip interfejsu przyjdzie wiadomość to i tak ją wyłapiemy
+    server_address.sin_addr.s_addr = htonl(INADDR_ANY); // Receive packets from any interface
 
     int bind_result = bind (
         sockfd,
@@ -133,7 +134,7 @@ int setup_socket(uint16_t port) {
 ssize_t sending_packet(struct Connection* content, int sockfd, struct sockaddr_in* recipient) {
     uint8_t buffer[9];
 
-    // ładowanie buffera
+    // Fill the buffer
     memcpy(buffer, &(*content).network_bin, 4);
     memcpy(buffer + 4, &(*content).mask_size, 1);
     uint32_t net_dist = htonl((*content).dist);
@@ -151,7 +152,7 @@ ssize_t sending_packet(struct Connection* content, int sockfd, struct sockaddr_i
     return bytes_sent;
 }
 
-// rozsyłanie swojej tablicy przekazywania
+// Broadcast routing table to neighbors
 void broadcast_routing_table(
     int sockfd,
     struct Connection* directly, int directly_idx,
@@ -161,10 +162,10 @@ void broadcast_routing_table(
     recipient.sin_family = AF_INET;
     recipient.sin_port = htons(PORT);
 
-    for (int target_idx = 0; target_idx < directly_idx; target_idx++) { // do kogo? do każdego kto jest w directly
+    for (int target_idx = 0; target_idx < directly_idx; target_idx++) { // Send to each directly connected network
         recipient.sin_addr = directly[target_idx].broadcast_bin;
 
-        for (int content_idx = 0; content_idx < *routing_table_idx; content_idx++) { // a co? wszystko co mamy w routing_table
+        for (int content_idx = 0; content_idx < *routing_table_idx; content_idx++) { // Send every route from the routing table
             ssize_t bytes_sent = sending_packet(&routing_table[content_idx], sockfd, &recipient);
             if (bytes_sent == -1) {
                 for (int check_idx = 0; check_idx < *routing_table_idx; check_idx++) {
@@ -177,7 +178,7 @@ void broadcast_routing_table(
                 }
                 break;
             }
-            else { // jeśli udało się wysłać to znaczy, że sieć bezpośrednia jest osiągalna
+            else { // Successful transmission means the direct network is reachable
                 int found_idx = find_route_index(routing_table, *routing_table_idx, directly[target_idx].network_bin);
                 if (found_idx == -1) {
                     routing_table[*routing_table_idx] = directly[target_idx];
@@ -216,7 +217,7 @@ void handle_incoming_packet(
     struct Connection* routing_table, int* routing_table_idx,
     struct in_addr* my_ips, int n
 ) {
-    // rozbieranie buffera
+    // Unpack the received packet buffer
     struct in_addr recv_network_bin;
     uint8_t recv_mask_size;
     uint32_t recv_dist;
@@ -226,18 +227,18 @@ void handle_incoming_packet(
     memcpy(&recv_dist, buffer + 5, 4);
     recv_dist = ntohl(recv_dist);
 
-    // szukamy połączenia bezpośredniego z tym skąd nam przyszło
+    // Find direct interface of the sender
     int found_via = find_direct_interface(directly, directly_idx, sender->sin_addr);
     if (found_via == -1)
         return;
 
-    // odrzucamy jeśli odebraliśmy pakiet od samych siebie
+    // Drop packet if it came from ourselves
     if (is_my_ip(sender->sin_addr, my_ips, n))
         return;
 
-    // aktualizacja bezpośredniego połączenia z senderem
+    // Update direct route to the sender's network
     int found_via_in_routing_table = find_route_index(routing_table, *routing_table_idx, directly[found_via].network_bin);
-    if (found_via_in_routing_table == -1) { // znaczy że trzeba dodać do routing_table
+    if (found_via_in_routing_table == -1) { // Network not in table yet; add direct route
         routing_table[*routing_table_idx] = directly[found_via];
         (*routing_table_idx)++;
     }
@@ -245,7 +246,7 @@ void handle_incoming_packet(
         routing_table[found_via_in_routing_table] = directly[found_via];
     }
 
-    // tworzenie obiektu Connection z tego co odczytaliśmy
+    // Create Connection struct from received data
     struct Connection con;
     con.network_bin = recv_network_bin;
     con.mask_size = recv_mask_size;
@@ -261,15 +262,15 @@ void handle_incoming_packet(
     con.age_counter = 0;
     con.updated = true;
 
-    // szukamy wpisu w tablicy routingu z tym co nam przyszło
+    // Check if this network is already in routing table
     int found_target = find_route_index(routing_table, *routing_table_idx, recv_network_bin);
-    if (found_target == -1) { // to znaczy że nie ma pasującego wpisu w tablicy routing i musimy dodać nowy
+    if (found_target == -1) { // No matching route found; insert new entry if reachable
         if (con.dist != INF) {
             routing_table[*routing_table_idx] = con;
             (*routing_table_idx)++;
         }
     }
-    else { // jeśli istnieje odpowiadający wpis w tablicy routingu, być może będzie trzeba go poprawić
+    else { // Existing route found; update if shorter path or update from same next-hop
         if (routing_table[found_target].dist > con.dist) {
             routing_table[found_target] = con;
         }
@@ -280,7 +281,7 @@ void handle_incoming_packet(
     }
 }
 
-// nasłuchiwanie przychodzących informacji
+// Listen for incoming route updates during the round
 void receive_round_updates(
     int sockfd,
     struct Connection* directly, int directly_idx,
@@ -293,7 +294,7 @@ void receive_round_updates(
     socklen_t sender_len = sizeof(sender);
     uint8_t buffer[IP_MAXPACKET+1];
 
-    // tworzenie obiektu do korzystania z poll()
+    // Setup struct for poll()
     struct pollfd ps;
     ps.fd = sockfd;
     ps.events = POLLIN;
@@ -314,7 +315,7 @@ void receive_round_updates(
             ERROR("poll error");
         }
         else {
-            // pobieramy datagram UDP
+            // Receive incoming UDP datagram
             ssize_t datagram_len = recvfrom(
                 sockfd,
                 buffer,
@@ -339,7 +340,7 @@ void receive_round_updates(
     }
 }
 
-// starzenie i usuwanie nieosiągalnych tras
+// Age routes and remove unreachable ones
 void age_routing_table(struct Connection* routing_table, int* routing_table_idx) {
     for (int idx = 0; idx < *routing_table_idx; idx++) {
         if (routing_table[idx].updated == false) {
@@ -385,28 +386,28 @@ int main() {
     int directly_idx = 0, routing_table_idx = 0, n = 0;
     struct in_addr my_ips[MAX_CONNECTIONS];
 
-    // wczytanie interfejsów dla danego routera
+    // Read router interfaces from stdin
     read_interfaces(directly, &directly_idx, routing_table, &routing_table_idx, my_ips, &n);
 
-    // tworzenie i konfiguracja gniazda
+    // Create and configure UDP socket
     int sockfd = setup_socket(PORT);
 
     while (1) {
-        // oznaczamy wszystkie połączenia jako niezaktualizowane w tej rundzie
+        // Reset update flags for all routes at the start of the round
         for (int  idx=0; idx<routing_table_idx; idx++) {
             routing_table[idx].updated = false;
         }
 
-        // rozsyłanie swojej tablicy przekazywania
+        // Broadcast routing table to neighbors
         broadcast_routing_table(sockfd, directly, directly_idx, routing_table, &routing_table_idx);
 
-        // nasłuchiwanie przychodzących informacji
+        // Listen for incoming route updates during the round
         receive_round_updates(sockfd, directly, directly_idx, routing_table, &routing_table_idx, my_ips, n);
 
-        // starzenie i usuwanie nieosiągalnych tras
+        // Age routes and remove unreachable ones
         age_routing_table(routing_table, &routing_table_idx);
 
-        // wypisujemy routing_table raz na rundę
+        // Print routing table once per round
         print_routing_table(routing_table, routing_table_idx);
     }
 
